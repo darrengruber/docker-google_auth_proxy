@@ -5,8 +5,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"html/template"
 	"io/ioutil"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -23,13 +25,13 @@ const oauthStartPath = "/oauth2/start"
 const oauthCallbackPath = "/oauth2/callback"
 
 type OauthProxy struct {
-	CookieSeed      string
-	CookieKey       string
-	CookieDomain    string
-	CookieHttpsOnly bool
-	CookieHttpOnly  bool
-	CookieExpire    time.Duration
-	Validator       func(string) bool
+	CookieSeed     string
+	CookieKey      string
+	CookieDomain   string
+	CookieSecure   bool
+	CookieHttpOnly bool
+	CookieExpire   time.Duration
+	Validator      func(string) bool
 
 	redirectUrl         *url.URL // the url to receive requests at
 	oauthRedemptionUrl  *url.URL // endpoint to redeem the code
@@ -40,10 +42,44 @@ type OauthProxy struct {
 	SignInMessage       string
 	HtpasswdFile        *HtpasswdFile
 	DisplayHtpasswdForm bool
-	serveMux            *http.ServeMux
+	serveMux            http.Handler
 	PassBasicAuth       bool
 	skipAuthRegex       []string
 	compiledRegex       []*regexp.Regexp
+	templates           *template.Template
+}
+
+type UpstreamProxy struct {
+	upstream string
+	handler  http.Handler
+}
+
+func (u *UpstreamProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("GAP-Upstream-Address", u.upstream)
+	u.handler.ServeHTTP(w, r)
+}
+
+func NewReverseProxy(target *url.URL) (proxy *httputil.ReverseProxy) {
+	return httputil.NewSingleHostReverseProxy(target)
+}
+func setProxyUpstreamHostHeader(proxy *httputil.ReverseProxy, target *url.URL) {
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		// use RequestURI so that we aren't unescaping encoded slashes in the request path
+		req.Host = target.Host
+		req.URL.Opaque = req.RequestURI
+		req.URL.RawQuery = ""
+	}
+}
+func setProxyDirector(proxy *httputil.ReverseProxy) {
+	director := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		director(req)
+		// use RequestURI so that we aren't unescaping encoded slashes in the request path
+		req.URL.Opaque = req.RequestURI
+		req.URL.RawQuery = ""
+	}
 }
 
 func NewOauthProxy(opts *Options, validator func(string) bool) *OauthProxy {
@@ -54,7 +90,13 @@ func NewOauthProxy(opts *Options, validator func(string) bool) *OauthProxy {
 		path := u.Path
 		u.Path = ""
 		log.Printf("mapping path %q => upstream %q", path, u)
-		serveMux.Handle(path, httputil.NewSingleHostReverseProxy(u))
+		proxy := NewReverseProxy(u)
+		if !opts.PassHostHeader {
+			setProxyUpstreamHostHeader(proxy, u)
+		} else {
+			setProxyDirector(proxy)
+		}
+		serveMux.Handle(path, &UpstreamProxy{u.Host, proxy})
 	}
 	for _, u := range opts.CompiledRegex {
 		log.Printf("compiled skip-auth-regex => %q", u)
@@ -68,15 +110,21 @@ func NewOauthProxy(opts *Options, validator func(string) bool) *OauthProxy {
 	if domain == "" {
 		domain = "<default>"
 	}
-	log.Printf("Cookie settings: https_only: %v httponly: %v expiry: %s domain:%s", opts.CookieHttpsOnly, opts.CookieHttpOnly, opts.CookieExpire, domain)
+	if !opts.CookieHttpsOnly {
+		log.Printf("Warning: cookie-https-only setting is deprecated and will be removed in a future version. use cookie-secure")
+		opts.CookieSecure = opts.CookieHttpsOnly
+	}
+
+	log.Printf("Cookie settings: secure (https):%v httponly:%v expiry:%s domain:%s", opts.CookieSecure, opts.CookieHttpOnly, opts.CookieExpire, domain)
+
 	return &OauthProxy{
-		CookieKey:       "_oauthproxy",
-		CookieSeed:      opts.CookieSecret,
-		CookieDomain:    opts.CookieDomain,
-		CookieHttpsOnly: opts.CookieHttpsOnly,
-		CookieHttpOnly:  opts.CookieHttpOnly,
-		CookieExpire:    opts.CookieExpire,
-		Validator:       validator,
+		CookieKey:      "_oauthproxy",
+		CookieSeed:     opts.CookieSecret,
+		CookieDomain:   opts.CookieDomain,
+		CookieSecure:   opts.CookieSecure,
+		CookieHttpOnly: opts.CookieHttpOnly,
+		CookieExpire:   opts.CookieExpire,
+		Validator:      validator,
 
 		clientID:           opts.ClientID,
 		clientSecret:       opts.ClientSecret,
@@ -88,18 +136,37 @@ func NewOauthProxy(opts *Options, validator func(string) bool) *OauthProxy {
 		skipAuthRegex:      opts.SkipAuthRegex,
 		compiledRegex:      opts.CompiledRegex,
 		PassBasicAuth:      opts.PassBasicAuth,
+		templates:          loadTemplates(opts.CustomTemplatesDir),
 	}
 }
 
-func (p *OauthProxy) GetLoginURL(redirectUrl string) string {
+func (p *OauthProxy) GetRedirectUrl(host string) string {
+	// default to the request Host if not set
+	if p.redirectUrl.Host != "" {
+		return p.redirectUrl.String()
+	}
+	var u url.URL
+	u = *p.redirectUrl
+	if u.Scheme == "" {
+		if p.CookieSecure {
+			u.Scheme = "https"
+		} else {
+			u.Scheme = "http"
+		}
+	}
+	u.Host = host
+	return u.String()
+}
+
+func (p *OauthProxy) GetLoginURL(host, redirect string) string {
 	params := url.Values{}
-	params.Add("redirect_uri", p.redirectUrl.String())
+	params.Add("redirect_uri", p.GetRedirectUrl(host))
 	params.Add("approval_prompt", "force")
 	params.Add("scope", p.oauthScope)
 	params.Add("client_id", p.clientID)
 	params.Add("response_type", "code")
-	if strings.HasPrefix(redirectUrl, "/") {
-		params.Add("state", redirectUrl)
+	if strings.HasPrefix(redirect, "/") {
+		params.Add("state", redirect)
 	}
 	return fmt.Sprintf("%s?%s", p.oauthLoginUrl, params.Encode())
 }
@@ -130,12 +197,12 @@ func (p *OauthProxy) displayCustomLoginForm() bool {
 	return p.HtpasswdFile != nil && p.DisplayHtpasswdForm
 }
 
-func (p *OauthProxy) redeemCode(code string) (string, string, error) {
+func (p *OauthProxy) redeemCode(host, code string) (string, string, error) {
 	if code == "" {
 		return "", "", errors.New("missing code")
 	}
 	params := url.Values{}
-	params.Add("redirect_uri", p.redirectUrl.String())
+	params.Add("redirect_uri", p.GetRedirectUrl(host))
 	params.Add("client_id", p.clientID)
 	params.Add("client_secret", p.clientSecret)
 	params.Add("code", code)
@@ -189,8 +256,14 @@ func jwtDecodeSegment(seg string) ([]byte, error) {
 }
 
 func (p *OauthProxy) ClearCookie(rw http.ResponseWriter, req *http.Request) {
-	domain := strings.Split(req.Host, ":")[0]
-	if p.CookieDomain != "" && strings.HasSuffix(domain, p.CookieDomain) {
+	domain := req.Host
+	if h, _, err := net.SplitHostPort(domain); err == nil {
+		domain = h
+	}
+	if p.CookieDomain != "" {
+		if !strings.HasSuffix(domain, p.CookieDomain) {
+			log.Printf("Warning: request host is %q but using configured cookie domain of %q", domain, p.CookieDomain)
+		}
 		domain = p.CookieDomain
 	}
 	cookie := &http.Cookie{
@@ -198,16 +271,23 @@ func (p *OauthProxy) ClearCookie(rw http.ResponseWriter, req *http.Request) {
 		Value:    "",
 		Path:     "/",
 		Domain:   domain,
-		Expires:  time.Now().Add(time.Duration(1) * time.Hour * -1),
 		HttpOnly: p.CookieHttpOnly,
+		Secure:   p.CookieSecure,
+		Expires:  time.Now().Add(time.Duration(1) * time.Hour * -1),
 	}
 	http.SetCookie(rw, cookie)
 }
 
 func (p *OauthProxy) SetCookie(rw http.ResponseWriter, req *http.Request, val string) {
 
-	domain := strings.Split(req.Host, ":")[0] // strip the port (if any)
-	if p.CookieDomain != "" && strings.HasSuffix(domain, p.CookieDomain) {
+	domain := req.Host
+	if h, _, err := net.SplitHostPort(domain); err == nil {
+		domain = h
+	}
+	if p.CookieDomain != "" {
+		if !strings.HasSuffix(domain, p.CookieDomain) {
+			log.Printf("Warning: request host is %q but using configured cookie domain of %q", domain, p.CookieDomain)
+		}
 		domain = p.CookieDomain
 	}
 	cookie := &http.Cookie{
@@ -216,7 +296,7 @@ func (p *OauthProxy) SetCookie(rw http.ResponseWriter, req *http.Request, val st
 		Path:     "/",
 		Domain:   domain,
 		HttpOnly: p.CookieHttpOnly,
-		Secure:   p.CookieHttpsOnly,
+		Secure:   p.CookieSecure,
 		Expires:  time.Now().Add(p.CookieExpire),
 	}
 	http.SetCookie(rw, cookie)
@@ -230,7 +310,6 @@ func (p *OauthProxy) PingPage(rw http.ResponseWriter) {
 func (p *OauthProxy) ErrorPage(rw http.ResponseWriter, code int, title string, message string) {
 	log.Printf("ErrorPage %d %s %s", code, title, message)
 	rw.WriteHeader(code)
-	templates := getTemplates()
 	t := struct {
 		Title   string
 		Message string
@@ -238,13 +317,12 @@ func (p *OauthProxy) ErrorPage(rw http.ResponseWriter, code int, title string, m
 		Title:   fmt.Sprintf("%d %s", code, title),
 		Message: message,
 	}
-	templates.ExecuteTemplate(rw, "error.html", t)
+	p.templates.ExecuteTemplate(rw, "error.html", t)
 }
 
 func (p *OauthProxy) SignInPage(rw http.ResponseWriter, req *http.Request, code int) {
 	p.ClearCookie(rw, req)
 	rw.WriteHeader(code)
-	templates := getTemplates()
 
 	t := struct {
 		SignInMessage string
@@ -257,7 +335,7 @@ func (p *OauthProxy) SignInPage(rw http.ResponseWriter, req *http.Request, code 
 		Redirect:      req.URL.RequestURI(),
 		Version:       VERSION,
 	}
-	templates.ExecuteTemplate(rw, "sign_in.html", t)
+	p.templates.ExecuteTemplate(rw, "sign_in.html", t)
 }
 
 func (p *OauthProxy) ManualSignIn(rw http.ResponseWriter, req *http.Request) (string, bool) {
@@ -271,7 +349,7 @@ func (p *OauthProxy) ManualSignIn(rw http.ResponseWriter, req *http.Request) (st
 	}
 	// check auth
 	if p.HtpasswdFile.Validate(user, passwd) {
-		log.Printf("authenticated %s via manual sign in", user)
+		log.Printf("authenticated %q via HtpasswdFile", user)
 		return user, true
 	}
 	return "", false
@@ -299,7 +377,6 @@ func (p *OauthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if req.Header.Get("X-Real-IP") != "" {
 		remoteAddr += fmt.Sprintf(" (%q)", req.Header.Get("X-Real-IP"))
 	}
-	log.Printf("%s %s %s", remoteAddr, req.Method, req.URL.RequestURI())
 
 	var ok bool
 	var user string
@@ -341,7 +418,7 @@ func (p *OauthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			p.ErrorPage(rw, 500, "Internal Error", err.Error())
 			return
 		}
-		http.Redirect(rw, req, p.GetLoginURL(redirect), 302)
+		http.Redirect(rw, req, p.GetLoginURL(req.Host, redirect), 302)
 		return
 	}
 	if req.URL.Path == oauthCallbackPath {
@@ -357,7 +434,7 @@ func (p *OauthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		_, email, err := p.redeemCode(req.Form.Get("code"))
+		_, email, err := p.redeemCode(req.Host, req.Form.Get("code"))
 		if err != nil {
 			log.Printf("%s error redeeming code %s", remoteAddr, err)
 			p.ErrorPage(rw, 500, "Internal Error", err.Error())
@@ -391,15 +468,9 @@ func (p *OauthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	if !ok {
 		user, ok = p.CheckBasicAuth(req)
-		// if we want to promote basic auth requests to cookie'd requests, we could do that here
-		// not sure that would be ideal in all circumstances though
-		// if ok {
-		// 	p.SetCookie(rw, req, user)
-		// }
 	}
 
 	if !ok {
-		log.Printf("%s - invalid cookie session", remoteAddr)
 		p.SignInPage(rw, req, 403)
 		return
 	}
@@ -409,6 +480,11 @@ func (p *OauthProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		req.SetBasicAuth(user, "")
 		req.Header["X-Forwarded-User"] = []string{user}
 		req.Header["X-Forwarded-Email"] = []string{email}
+	}
+	if email == "" {
+		rw.Header().Set("GAP-Auth", user)
+	} else {
+		rw.Header().Set("GAP-Auth", email)
 	}
 
 	p.serveMux.ServeHTTP(rw, req)
@@ -431,7 +507,7 @@ func (p *OauthProxy) CheckBasicAuth(req *http.Request) (string, bool) {
 		return "", false
 	}
 	if p.HtpasswdFile.Validate(pair[0], pair[1]) {
-		log.Printf("authenticated %s via basic auth", pair[0])
+		log.Printf("authenticated %q via basic auth", pair[0])
 		return pair[0], true
 	}
 	return "", false
